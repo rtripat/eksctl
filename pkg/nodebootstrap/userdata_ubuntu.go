@@ -1,28 +1,40 @@
 package nodebootstrap
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/kris-nova/logger"
 	"github.com/pkg/errors"
-
-	"github.com/kubicorn/kubicorn/pkg/logger"
-
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
 	"github.com/weaveworks/eksctl/pkg/cloudconfig"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
 )
 
-func makeUbuntu1804Config(spec *api.ClusterConfig, nodeGroupID int) (configFiles, error) {
-	clientConfigData, err := makeClientConfigData(spec, nodeGroupID)
+func makeUbuntu1804Config(spec *api.ClusterConfig, ng *api.NodeGroup) (configFiles, error) {
+	clientConfigData, err := makeClientConfigData(spec, ng)
 	if err != nil {
 		return nil, err
 	}
 
+	if len(spec.Status.CertificateAuthorityData) == 0 {
+		return nil, errors.New("invalid cluster config: missing CertificateAuthorityData")
+	}
+
+	if ng.MaxPodsPerNode == 0 {
+		ng.MaxPodsPerNode = maxPodsPerNodeType[ng.InstanceType]
+	}
+
+	kubeletEnvParams := append(makeCommonKubeletEnvParams(spec, ng),
+		fmt.Sprintf("MAX_PODS=%d", ng.MaxPodsPerNode),
+		fmt.Sprintf("CLUSTER_DNS=%s", clusterDNS(spec, ng)),
+	)
+
 	files := configFiles{
 		configDir: {
 			"metadata.env": {content: strings.Join(makeMetadata(spec), "\n")},
-			"kubelet.env":  {content: strings.Join(makeKubeletParams(spec, nodeGroupID), "\n")},
+			"kubelet.env":  {content: strings.Join(kubeletEnvParams, "\n")},
 			// TODO: https://github.com/weaveworks/eksctl/issues/161
-			"ca.crt":          {content: string(spec.CertificateAuthorityData)},
+			"ca.crt":          {content: string(spec.Status.CertificateAuthorityData)},
 			"kubeconfig.yaml": {content: string(clientConfigData)},
 		},
 	}
@@ -31,16 +43,24 @@ func makeUbuntu1804Config(spec *api.ClusterConfig, nodeGroupID int) (configFiles
 }
 
 // NewUserDataForUbuntu1804 creates new user data for Ubuntu 18.04 nodes
-func NewUserDataForUbuntu1804(spec *api.ClusterConfig, nodeGroupID int) (string, error) {
+func NewUserDataForUbuntu1804(spec *api.ClusterConfig, ng *api.NodeGroup) (string, error) {
 	config := cloudconfig.New()
 
-	scripts := []string{
-		"bootstrap.ubuntu.sh",
-	}
-
-	files, err := makeUbuntu1804Config(spec, nodeGroupID)
+	files, err := makeUbuntu1804Config(spec, ng)
 	if err != nil {
 		return "", err
+	}
+
+	scripts := []string{}
+
+	for _, command := range ng.PreBootstrapCommands {
+		config.AddShellCommand(command)
+	}
+
+	if ng.OverrideBootstrapCommand != nil {
+		config.AddShellCommand(*ng.OverrideBootstrapCommand)
+	} else {
+		scripts = append(scripts, "bootstrap.ubuntu.sh")
 	}
 
 	if err = addFilesAndScripts(config, files, scripts); err != nil {

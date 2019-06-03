@@ -3,23 +3,22 @@ package create
 import (
 	"fmt"
 	"os"
+	"strings"
 
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"github.com/weaveworks/eksctl/pkg/ami"
+	"github.com/spf13/pflag"
+
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
+	"github.com/weaveworks/eksctl/pkg/authconfigmap"
 	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 	"github.com/weaveworks/eksctl/pkg/eks"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
 	"github.com/weaveworks/eksctl/pkg/kops"
+	"github.com/weaveworks/eksctl/pkg/printers"
 	"github.com/weaveworks/eksctl/pkg/utils"
 	"github.com/weaveworks/eksctl/pkg/utils/kubeconfig"
 	"github.com/weaveworks/eksctl/pkg/vpc"
-)
-
-const (
-	defaultNodeType     = "m5.large"
-	defaultSSHPublicKey = "~/.ssh/id_rsa.pub"
 )
 
 var (
@@ -31,9 +30,11 @@ var (
 
 	kopsClusterNameForVPC string
 	subnets               map[api.SubnetTopology]*[]string
+	addonsStorageClass    bool
+	withoutNodeGroup      bool
 )
 
-func createClusterCmd() *cobra.Command {
+func createClusterCmd(g *cmdutils.Grouping) *cobra.Command {
 	p := &api.ProviderConfig{}
 	cfg := api.NewClusterConfig()
 	ng := cfg.NewNodeGroup()
@@ -41,64 +42,74 @@ func createClusterCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cluster",
 		Short: "Create a cluster",
-		Run: func(_ *cobra.Command, args []string) {
-			if err := doCreateCluster(p, cfg, ng, cmdutils.GetNameArg(args)); err != nil {
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := doCreateCluster(p, cfg, cmdutils.GetNameArg(args), cmd); err != nil {
 				logger.Critical("%s\n", err.Error())
 				os.Exit(1)
 			}
 		},
 	}
 
-	fs := cmd.Flags()
+	group := g.New(cmd)
 
-	cmdutils.AddCommonFlagsForAWS(fs, p)
+	exampleClusterName := cmdutils.ClusterName("", "")
+	exampleNodeGroupName := cmdutils.NodeGroupName("", "")
 
-	exampleClusterName := utils.ClusterName("", "")
+	group.InFlagSet("General", func(fs *pflag.FlagSet) {
+		fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", fmt.Sprintf("EKS cluster name (generated if unspecified, e.g. %q)", exampleClusterName))
+		fs.StringToStringVarP(&cfg.Metadata.Tags, "tags", "", map[string]string{}, `A list of KV pairs used to tag the AWS resources (e.g. "Owner=John Doe,Team=Some Team")`)
+		cmdutils.AddRegionFlag(fs, p)
+		fs.StringSliceVar(&availabilityZones, "zones", nil, "(auto-select if unspecified)")
+		cmdutils.AddVersionFlag(fs, cfg.Metadata, "")
+		cmdutils.AddConfigFileFlag(&clusterConfigFile, fs)
+	})
 
-	fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", fmt.Sprintf("EKS cluster name (generated if unspecified, e.g. %q)", exampleClusterName))
+	group.InFlagSet("Initial nodegroup", func(fs *pflag.FlagSet) {
+		fs.StringVar(&ng.Name, "nodegroup-name", "", fmt.Sprintf("name of the nodegroup (generated if unspecified, e.g. %q)", exampleNodeGroupName))
+		fs.BoolVar(&withoutNodeGroup, "without-nodegroup", false, "if set, initial nodegroup will not be created")
+		cmdutils.AddCommonCreateNodeGroupFlags(cmd, fs, p, cfg, ng)
+	})
 
-	fs.StringToStringVarP(&cfg.Metadata.Tags, "tags", "", map[string]string{}, `A list of KV pairs used to tag the AWS resources (e.g. "Owner=John Doe,Team=Some Team")`)
+	group.InFlagSet("Cluster and nodegroup add-ons", func(fs *pflag.FlagSet) {
+		cmdutils.AddCommonCreateNodeGroupIAMAddonsFlags(fs, ng)
+		fs.BoolVar(&addonsStorageClass, "storage-class", true, "if true (default) then a default StorageClass of type gp2 provisioned by EBS will be created")
+	})
 
-	fs.StringVarP(&ng.InstanceType, "node-type", "t", defaultNodeType, "node instance type")
-	fs.IntVarP(&ng.DesiredCapacity, "nodes", "N", api.DefaultNodeCount, "total number of nodes (desired capacity of ASG)")
+	group.InFlagSet("VPC networking", func(fs *pflag.FlagSet) {
+		fs.IPNetVar(&cfg.VPC.CIDR.IPNet, "vpc-cidr", cfg.VPC.CIDR.IPNet, "global CIDR to use for VPC")
+		subnets = map[api.SubnetTopology]*[]string{
+			api.SubnetTopologyPrivate: fs.StringSlice("vpc-private-subnets", nil, "re-use private subnets of an existing VPC"),
+			api.SubnetTopologyPublic:  fs.StringSlice("vpc-public-subnets", nil, "re-use public subnets of an existing VPC"),
+		}
+		fs.StringVar(&kopsClusterNameForVPC, "vpc-from-kops-cluster", "", "re-use VPC from a given kops cluster")
+	})
 
-	// TODO: https://github.com/weaveworks/eksctl/issues/28
-	fs.IntVarP(&ng.MinSize, "nodes-min", "m", 0, "minimum nodes in ASG (leave unset for a static nodegroup)")
-	fs.IntVarP(&ng.MaxSize, "nodes-max", "M", 0, "maximum nodes in ASG (leave unset for a static nodegroup)")
+	cmdutils.AddCommonFlagsForAWS(group, p, true)
 
-	fs.IntVarP(&ng.VolumeSize, "node-volume-size", "", 0, "Node volume size (in GB)")
-	fs.IntVar(&ng.MaxPodsPerNode, "max-pods-per-node", 0, "maximum number of pods per node (set automatically if unspecified)")
-	fs.StringSliceVar(&availabilityZones, "zones", nil, "(auto-select if unspecified)")
+	group.InFlagSet("Output kubeconfig", func(fs *pflag.FlagSet) {
+		cmdutils.AddCommonFlagsForKubeconfig(fs, &kubeconfigPath, &setContext, &autoKubeconfigPath, exampleClusterName)
+		fs.BoolVar(&writeKubeconfig, "write-kubeconfig", true, "toggle writing of kubeconfig")
+	})
 
-	fs.BoolVar(&ng.AllowSSH, "ssh-access", false, "control SSH access for nodes")
-	fs.StringVar(&ng.SSHPublicKeyPath, "ssh-public-key", defaultSSHPublicKey, "SSH public key to use for nodes (import from local path, or use existing EC2 key pair)")
-
-	fs.BoolVar(&writeKubeconfig, "write-kubeconfig", true, "toggle writing of kubeconfig")
-	cmdutils.AddCommonFlagsForKubeconfig(fs, &kubeconfigPath, &setContext, &autoKubeconfigPath, exampleClusterName)
-
-	fs.BoolVar(&cfg.Addons.WithIAM.PolicyAmazonEC2ContainerRegistryPowerUser, "full-ecr-access", false, "enable full access to ECR")
-	fs.BoolVar(&cfg.Addons.WithIAM.PolicyAutoScaling, "asg-access", false, "enable iam policy dependency for cluster-autoscaler")
-	fs.BoolVar(&cfg.Addons.Storage, "storage-class", true, "if true (default) then a default StorageClass of type gp2 provisioned by EBS will be created")
-
-	fs.StringVar(&ng.AMI, "node-ami", ami.ResolverStatic, "Advanced use cases only. If 'static' is supplied (default) then eksctl will use static AMIs; if 'auto' is supplied then eksctl will automatically set the AMI based on region/instance type; if any other value is supplied it will override the AMI to use for the nodes. Use with extreme care.")
-	fs.StringVar(&ng.AMIFamily, "node-ami-family", ami.ImageFamilyAmazonLinux2, "Advanced use cases only. If 'AmazonLinux2' is supplied (default), then eksctl will use the offical AWS EKS AMIs (Amazon Linux 2); if 'Ubuntu1804' is supplied, then eksctl will use the offical Canonical EKS AMIs (Ubuntu 18.04).")
-
-	fs.StringVar(&kopsClusterNameForVPC, "vpc-from-kops-cluster", "", "re-use VPC from a given kops cluster")
-
-	fs.IPNetVar(cfg.VPC.CIDR, "vpc-cidr", api.DefaultCIDR(), "global CIDR to use for VPC")
-
-	subnets = map[api.SubnetTopology]*[]string{
-		api.SubnetTopologyPrivate: fs.StringSlice("vpc-private-subnets", nil, "re-use private subnets of an existing VPC"),
-		api.SubnetTopologyPublic:  fs.StringSlice("vpc-public-subnets", nil, "re-use public subnets of an existing VPC"),
-	}
-
-	fs.BoolVarP(&ng.PrivateNetworking, "node-private-networking", "P", false, "whether to make initial nodegroup networking private")
+	group.AddTo(cmd)
 
 	return cmd
 }
 
-func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.NodeGroup, nameArg string) error {
+func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg string, cmd *cobra.Command) error {
+	ngFilter := cmdutils.NewNodeGroupFilter()
+	ngFilter.ExcludeAll = withoutNodeGroup
+
+	if err := cmdutils.NewCreateClusterLoader(p, cfg, clusterConfigFile, nameArg, cmd, ngFilter).Load(); err != nil {
+		return err
+	}
+
+	if err := ngFilter.ValidateNodeGroupsAndSetDefaults(cfg.NodeGroups); err != nil {
+		return err
+	}
+
 	meta := cfg.Metadata
+	printer := printers.NewJSONPrinter()
 	ctl := eks.New(p, cfg)
 
 	if !ctl.IsSupportedRegion() {
@@ -106,14 +117,24 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 	}
 	logger.Info("using region %s", meta.Region)
 
+	if cfg.Metadata.Version == "" {
+		cfg.Metadata.Version = api.LatestVersion
+	}
+	if cfg.Metadata.Version != api.LatestVersion {
+		validVersion := false
+		for _, v := range api.SupportedVersions() {
+			if cfg.Metadata.Version == v {
+				validVersion = true
+			}
+		}
+		if !validVersion {
+			return fmt.Errorf("invalid version, supported values: %s", strings.Join(api.SupportedVersions(), ", "))
+		}
+	}
+
 	if err := ctl.CheckAuth(); err != nil {
 		return err
 	}
-
-	if utils.ClusterName(meta.Name, nameArg) == "" {
-		return cmdutils.ErrNameFlagAndArg(meta.Name, nameArg)
-	}
-	meta.Name = utils.ClusterName(meta.Name, nameArg)
 
 	if autoKubeconfigPath {
 		if kubeconfigPath != kubeconfig.DefaultPath {
@@ -122,21 +143,30 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 		kubeconfigPath = kubeconfig.AutoPath(meta.Name)
 	}
 
-	if ng.SSHPublicKeyPath == "" {
-		return fmt.Errorf("--ssh-public-key must be non-empty string")
+	if checkSubnetsGivenAsFlags() {
+		// undo defaulting and reset it, as it's not set via config file;
+		// default value here causes errors as vpc.ImportVPC doesn't
+		// treat remote state as authority over local state
+		cfg.VPC.CIDR = nil
+		// load subnets from local map created from flags, into the config
+		for topology := range subnets {
+			if err := vpc.ImportSubnetsFromList(ctl.Provider, cfg, topology, *subnets[topology]); err != nil {
+				return err
+			}
+		}
 	}
+	subnetsGiven := cfg.HasAnySubnets() // this will be false when neither flags nor config has any subnets
 
 	createOrImportVPC := func() error {
-		subnetsGiven := len(*subnets[api.SubnetTopologyPrivate])+len(*subnets[api.SubnetTopologyPublic]) != 0
 
 		subnetInfo := func() string {
 			return fmt.Sprintf("VPC (%s) and subnets (private:%v public:%v)",
-				cfg.VPC.ID, cfg.SubnetIDs(api.SubnetTopologyPrivate), cfg.SubnetIDs(api.SubnetTopologyPublic))
+				cfg.VPC.ID, cfg.PrivateSubnetIDs(), cfg.PublicSubnetIDs())
 		}
 
 		customNetworkingNotice := "custom VPC/subnets will be used; if resulting cluster doesn't function as expected, make sure to review the configuration of VPC/subnets"
 
-		canUseForPrivateNodeGroup := func() error {
+		canUseForPrivateNodeGroups := func(_ int, ng *api.NodeGroup) error {
 			if ng.PrivateNetworking && !cfg.HasSufficientPrivateSubnets() {
 				return fmt.Errorf("none or too few private subnets to use with --node-private-networking")
 			}
@@ -159,6 +189,9 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 			if len(availabilityZones) != 0 {
 				return fmt.Errorf("--vpc-from-kops-cluster and --zones %s", cmdutils.IncompatibleFlags)
 			}
+			if cmd.Flag("vpc-cidr").Changed {
+				return fmt.Errorf("--vpc-from-kops-cluster and --vpc-cidr %s", cmdutils.IncompatibleFlags)
+			}
 
 			if subnetsGiven {
 				return fmt.Errorf("--vpc-from-kops-cluster and --vpc-private-subnets/--vpc-public-subnets %s", cmdutils.IncompatibleFlags)
@@ -173,7 +206,7 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 				return err
 			}
 
-			if err := canUseForPrivateNodeGroup(); err != nil {
+			if err := ngFilter.ForEach(cfg.NodeGroups, canUseForPrivateNodeGroups); err != nil {
 				return err
 			}
 
@@ -187,11 +220,12 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 		if len(availabilityZones) != 0 {
 			return fmt.Errorf("--vpc-private-subnets/--vpc-public-subnets and --zones %s", cmdutils.IncompatibleFlags)
 		}
+		if cmd.Flag("vpc-cidr").Changed {
+			return fmt.Errorf("--vpc-private-subnets/--vpc-public-subnets and --vpc-cidr %s", cmdutils.IncompatibleFlags)
+		}
 
-		for topology := range subnets {
-			if err := vpc.UseSubnets(ctl.Provider, cfg, topology, *subnets[topology]); err != nil {
-				return err
-			}
+		if err := vpc.ImportAllSubnets(ctl.Provider, cfg); err != nil {
+			return err
 		}
 
 		if err := cfg.HasSufficientSubnets(); err != nil {
@@ -199,7 +233,7 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 			return err
 		}
 
-		if err := canUseForPrivateNodeGroup(); err != nil {
+		if err := ngFilter.ForEach(cfg.NodeGroups, canUseForPrivateNodeGroups); err != nil {
 			return err
 		}
 
@@ -212,25 +246,53 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 		return err
 	}
 
-	if err := ctl.EnsureAMI(ng); err != nil {
+	err := ngFilter.ForEach(cfg.NodeGroups, func(_ int, ng *api.NodeGroup) error {
+		// resolve AMI
+		if err := ctl.EnsureAMI(meta.Version, ng); err != nil {
+			return err
+		}
+		logger.Info("nodegroup %q will use %q [%s/%s]", ng.Name, ng.AMI, ng.AMIFamily, cfg.Metadata.Version)
+
+		if err := ctl.SetNodeLabels(ng, meta); err != nil {
+			return err
+		}
+
+		// load or use SSH key - name includes cluster name and the
+		// fingerprint, so if unique keys provided, each will get
+		// loaded and used as intended and there is no need to have
+		// nodegroup name in the key name
+		if err := loadSSHKey(ng, meta.Name, ctl.Provider); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-
-	if err := ctl.LoadSSHPublicKey(meta.Name, ng); err != nil {
-		return err
-	}
-
-	logger.Debug("cfg = %#v", cfg)
 
 	logger.Info("creating %s", meta.LogString())
 
+	// TODO dry-run mode should provide a way to render config with all defaults set
+	// we should also make a call to resolve the AMI and write the result, similaraly
+	// the body of the SSH key can be read
+
+	if err := printer.LogObj(logger.Debug, "cfg.json = \\\n%s\n", cfg); err != nil {
+		return err
+	}
+
 	{ // core action
+		ngSubset, _ := ngFilter.MatchAll(cfg.NodeGroups)
 		stackManager := ctl.NewStackManager(cfg)
-		logger.Info("will create 2 separate CloudFormation stacks for cluster itself and the initial nodegroup")
+		if ngCount := ngSubset.Len(); ngCount == 1 && clusterConfigFile == "" {
+			logger.Info("will create 2 separate CloudFormation stacks for cluster itself and the initial nodegroup")
+		} else {
+			ngFilter.LogInfo(cfg.NodeGroups)
+			logger.Info("will create a CloudFormation stack for cluster itself and %d nodegroup stack(s)", ngCount)
+		}
 		logger.Info("if you encounter any issues, check CloudFormation console or try 'eksctl utils describe-stacks --region=%s --name=%s'", meta.Region, meta.Name)
-		errs := stackManager.CreateClusterWithNodeGroups()
-		// read any errors (it only gets non-nil errors)
-		if len(errs) > 0 {
+		tasks := stackManager.NewTasksToCreateClusterWithNodeGroups(ngSubset)
+		logger.Info(tasks.Describe())
+		if errs := tasks.DoAllSync(); len(errs) > 0 {
 			logger.Info("%d error(s) occurred and cluster hasn't been created properly, you may wish to check CloudFormation console", len(errs))
 			logger.Info("to cleanup resources, run 'eksctl delete cluster --region=%s --name=%s'", meta.Region, meta.Name)
 			for _, err := range errs {
@@ -245,25 +307,26 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 	// obtain cluster credentials, write kubeconfig
 
 	{ // post-creation action
-		clientConfigBase, err := ctl.NewClientConfig(cfg)
-		if err != nil {
-			return err
-		}
+		var kubeconfigContextName string
 
 		if writeKubeconfig {
-			config := clientConfigBase.WithExecAuthenticator()
-			kubeconfigPath, err = kubeconfig.Write(kubeconfigPath, config.Client, setContext)
+			client, err := ctl.NewClient(cfg, false)
+			if err != nil {
+				return err
+			}
+			kubeconfigContextName = client.ContextName
+
+			kubeconfigPath, err = kubeconfig.Write(kubeconfigPath, *client.Config, setContext)
 			if err != nil {
 				return errors.Wrap(err, "writing kubeconfig")
 			}
-
 			logger.Success("saved kubeconfig as %q", kubeconfigPath)
 		} else {
 			kubeconfigPath = ""
 		}
 
 		// create Kubernetes client
-		clientSet, err := clientConfigBase.NewClientSetWithEmbeddedToken()
+		clientSet, err := ctl.NewStdClientSet(cfg)
 		if err != nil {
 			return err
 		}
@@ -272,20 +335,38 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 			return err
 		}
 
-		// authorise nodes to join
-		if err = ctl.CreateNodeGroupAuthConfigMap(clientSet, ng); err != nil {
-			return err
-		}
-
-		// wait for nodes to join
-		if err = ctl.WaitForNodes(clientSet, ng); err != nil {
-			return err
-		}
-
-		// add default storage class
-		if cfg.Addons.Storage {
-			if err = ctl.AddDefaultStorageClass(clientSet); err != nil {
+		err = ngFilter.ForEach(cfg.NodeGroups, func(_ int, ng *api.NodeGroup) error {
+			// authorise nodes to join
+			if err = authconfigmap.AddNodeGroup(clientSet, ng); err != nil {
 				return err
+			}
+
+			// wait for nodes to join
+			if err = ctl.WaitForNodes(clientSet, ng); err != nil {
+				return err
+			}
+
+			// if GPU instance type, give instructions
+			if utils.IsGPUInstanceType(ng.InstanceType) {
+				logger.Info("as you are using a GPU optimized instance type you will need to install NVIDIA Kubernetes device plugin.")
+				logger.Info("\t see the following page for instructions: https://github.com/NVIDIA/k8s-device-plugin")
+			}
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		// add default storage class only for version 1.10 clusters
+		if meta.Version == "1.10" {
+			// --storage-class flag is only for backwards compatibility,
+			// we always create the storage class when --config-file is
+			// used, as this is 1.10-only
+			if addonsStorageClass || clusterConfigFile != "" {
+				if err = ctl.AddDefaultStorageClass(clientSet); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -296,19 +377,17 @@ func doCreateCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Node
 		if err != nil {
 			return err
 		}
-		if err := utils.CheckAllCommands(kubeconfigPath, setContext, clientConfigBase.ContextName, env); err != nil {
+		if err := utils.CheckAllCommands(kubeconfigPath, setContext, kubeconfigContextName, env); err != nil {
 			logger.Critical("%s\n", err.Error())
 			logger.Info("cluster should be functional despite missing (or misconfigured) client binaries")
-		}
-
-		// If GPU instance type, give instructions
-		if utils.IsGPUInstanceType(ng.InstanceType) {
-			logger.Info("as you are using a GPU optimized instance type you will need to install NVIDIA Kubernetes device plugin.")
-			logger.Info("\t see the following page for instructions: https://github.com/NVIDIA/k8s-device-plugin")
 		}
 	}
 
 	logger.Success("%s is ready", meta.LogString())
+
+	if err := printer.LogObj(logger.Debug, "cfg.json = \\\n%s\n", cfg); err != nil {
+		return err
+	}
 
 	return nil
 }

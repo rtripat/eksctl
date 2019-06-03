@@ -7,16 +7,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/weaveworks/eksctl/pkg/eks/api"
-	"github.com/weaveworks/eksctl/pkg/printers"
-
+	"github.com/kris-nova/logger"
 	"github.com/pkg/errors"
+
+	"github.com/aws/aws-sdk-go/aws/request"
+	awseks "github.com/aws/aws-sdk-go/service/eks"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 
-	awseks "github.com/aws/aws-sdk-go/service/eks"
-
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
+	"github.com/weaveworks/eksctl/pkg/printers"
+	"github.com/weaveworks/eksctl/pkg/utils/waiters"
+	"github.com/weaveworks/eksctl/pkg/vpc"
 )
 
 // DescribeControlPlane describes the cluster control plane
@@ -31,34 +34,62 @@ func (c *ClusterProvider) DescribeControlPlane(cl *api.ClusterMeta) (*awseks.Clu
 	return output.Cluster, nil
 }
 
-// DeprecatedDeleteControlPlane deletes the control plane
-func (c *ClusterProvider) DeprecatedDeleteControlPlane(cl *api.ClusterMeta) error {
+// DescribeControlPlaneMustBeActive describes the cluster control plane and checks if status is active
+func (c *ClusterProvider) DescribeControlPlaneMustBeActive(cl *api.ClusterMeta) (*awseks.Cluster, error) {
 	cluster, err := c.DescribeControlPlane(cl)
 	if err != nil {
-		return errors.Wrap(err, "not able to get control plane for deletion")
+		return nil, errors.Wrap(err, "unable to describe cluster control plane")
+	}
+	if *cluster.Status != awseks.ClusterStatusActive {
+		return nil, fmt.Errorf("status of cluster %q is %q, has to be %q", *cluster.Name, *cluster.Status, awseks.ClusterStatusActive)
 	}
 
-	input := &awseks.DeleteClusterInput{
-		Name: cluster.Name,
-	}
-
-	if _, err := c.Provider.EKS().DeleteCluster(input); err != nil {
-		return errors.Wrap(err, "unable to delete cluster control plane")
-	}
-	return nil
+	return cluster, nil
 }
 
-// GetCredentials retrieves the certificate authority data
-func (c *ClusterProvider) GetCredentials(cluster awseks.Cluster, spec *api.ClusterConfig) error {
-	spec.Endpoint = *cluster.Endpoint
+// GetCredentials retrieves cluster endpoint and the certificate authority data
+func (c *ClusterProvider) GetCredentials(spec *api.ClusterConfig) error {
+	// Check the cluster exists and is active
+	cluster, err := c.DescribeControlPlaneMustBeActive(spec.Metadata)
+	if err != nil {
+		return err
+	}
+	logger.Debug("cluster = %#v", cluster)
 
 	data, err := base64.StdEncoding.DecodeString(*cluster.CertificateAuthority.Data)
 	if err != nil {
 		return errors.Wrap(err, "decoding certificate authority data")
 	}
 
-	spec.CertificateAuthorityData = data
+	if spec.Status == nil {
+		spec.Status = &api.ClusterStatus{}
+	}
+
+	spec.Status.Endpoint = *cluster.Endpoint
+	spec.Status.CertificateAuthorityData = data
+	spec.Status.ARN = *cluster.Arn
+
+	c.Status.cachedClusterInfo = cluster
+
 	return nil
+}
+
+// ControlPlaneVersion returns cached version (EKS API)
+func (c *ClusterProvider) ControlPlaneVersion() string {
+	if c.Status.cachedClusterInfo == nil || c.Status.cachedClusterInfo.Version == nil {
+		return ""
+	}
+	return *c.Status.cachedClusterInfo.Version
+}
+
+// GetClusterVPC retrieves the VPC configuration
+func (c *ClusterProvider) GetClusterVPC(spec *api.ClusterConfig) error {
+	stack, err := c.NewStackManager(spec).DescribeClusterStack()
+	if err != nil {
+		return err
+	}
+
+	return vpc.UseFromCluster(c.Provider, stack, spec)
 }
 
 // ListClusters display details of all the EKS cluster in your account
@@ -85,7 +116,7 @@ func (c *ClusterProvider) ListClusters(clusterName string, chunkSize int, output
 	if err := c.doListClusters(int64(chunkSize), printer, &allClusters, eachRegion); err != nil {
 		return err
 	}
-	return printer.PrintObj("clusters", allClusters, os.Stdout)
+	return printer.PrintObjWithKind("clusters", allClusters, os.Stdout)
 }
 
 func (c *ClusterProvider) getClustersRequest(chunkSize int64, nextToken string) ([]*string, *string, error) {
@@ -130,7 +161,7 @@ func (c *ClusterProvider) doListClusters(chunkSize int64, printer printers.Outpu
 			})
 		}
 
-		if nextToken != nil && *nextToken != "" {
+		if api.IsSetAndNonEmptyString(nextToken) {
 			token = *nextToken
 		} else {
 			break
@@ -151,7 +182,7 @@ func (c *ClusterProvider) doGetCluster(clusterName string, printer printers.Outp
 	logger.Debug("cluster = %#v", output)
 
 	clusters := []*awseks.Cluster{output.Cluster} // TODO: in the future this will have multiple clusters
-	if err := printer.PrintObj("clusters", clusters, os.Stdout); err != nil {
+	if err := printer.PrintObjWithKind("clusters", clusters, os.Stdout); err != nil {
 		return err
 	}
 
@@ -159,7 +190,7 @@ func (c *ClusterProvider) doGetCluster(clusterName string, printer printers.Outp
 
 		if logger.Level >= 4 {
 			spec := &api.ClusterConfig{Metadata: &api.ClusterMeta{Name: clusterName}}
-			stacks, err := c.NewStackManager(spec).ListReadyStacks(fmt.Sprintf("^(eksclt|EKS)-%s-.*$", clusterName))
+			stacks, err := c.NewStackManager(spec).ListStacks(fmt.Sprintf("^(eksclt|EKS)-%s-.*$", clusterName))
 			if err != nil {
 				return errors.Wrapf(err, "listing CloudFormation stack for %q", clusterName)
 			}
@@ -168,12 +199,6 @@ func (c *ClusterProvider) doGetCluster(clusterName string, printer printers.Outp
 			}
 		}
 	}
-	return nil
-}
-
-// ListAllTaggedResources lists all tagged resources
-func (c *ClusterProvider) ListAllTaggedResources() error {
-	// TODO: https://github.com/weaveworks/eksctl/issues/26
 	return nil
 }
 
@@ -203,6 +228,51 @@ func (c *ClusterProvider) WaitForControlPlane(id *api.ClusterMeta, clientSet *ku
 	}
 }
 
+// UpdateClusterVersion calls eks.UpdateClusterVersion and updates to cfg.Metadata.Version,
+// it will return update ID along with an error (if it occurrs)
+func (c *ClusterProvider) UpdateClusterVersion(cfg *api.ClusterConfig) (string, error) {
+	input := &awseks.UpdateClusterVersionInput{
+		Name:    &cfg.Metadata.Name,
+		Version: &cfg.Metadata.Version,
+	}
+	output, err := c.Provider.EKS().UpdateClusterVersion(input)
+	if err != nil {
+		return "", err
+	}
+	return *output.Update.Id, nil
+}
+
+// UpdateClusterVersionBlocking calls UpdateClusterVersion and blocks until update
+// operation is successful
+func (c *ClusterProvider) UpdateClusterVersionBlocking(cfg *api.ClusterConfig) error {
+	id, err := c.UpdateClusterVersion(cfg)
+	if err != nil {
+		return err
+	}
+
+	newRequest := func() *request.Request {
+		input := &awseks.DescribeUpdateInput{
+			Name:     &cfg.Metadata.Name,
+			UpdateId: &id,
+		}
+		req, _ := c.Provider.EKS().DescribeUpdateRequest(input)
+		return req
+	}
+
+	msg := fmt.Sprintf("waiting for control plane %q version update", cfg.Metadata.Name)
+
+	acceptors := waiters.MakeAcceptors(
+		"Update.Status",
+		awseks.UpdateStatusSuccessful,
+		[]string{
+			awseks.UpdateStatusCancelled,
+			awseks.UpdateStatusFailed,
+		},
+	)
+
+	return waiters.Wait(cfg.Metadata.Name, msg, acceptors, newRequest, c.Provider.WaitTimeout(), nil)
+}
+
 func addSummaryTableColumns(printer *printers.TablePrinter) {
 	printer.AddColumn("NAME", func(c *awseks.Cluster) string {
 		return *c.Name
@@ -222,7 +292,7 @@ func addSummaryTableColumns(printer *printers.TablePrinter) {
 	printer.AddColumn("SUBNETS", func(c *awseks.Cluster) string {
 		subnets := sets.NewString()
 		for _, subnetid := range c.ResourcesVpcConfig.SubnetIds {
-			if *subnetid != "" {
+			if api.IsSetAndNonEmptyString(subnetid) {
 				subnets.Insert(*subnetid)
 			}
 		}
@@ -231,7 +301,7 @@ func addSummaryTableColumns(printer *printers.TablePrinter) {
 	printer.AddColumn("SECURITYGROUPS", func(c *awseks.Cluster) string {
 		groups := sets.NewString()
 		for _, sg := range c.ResourcesVpcConfig.SecurityGroupIds {
-			if *sg != "" {
+			if api.IsSetAndNonEmptyString(sg) {
 				groups.Insert(*sg)
 			}
 		}

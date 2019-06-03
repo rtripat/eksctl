@@ -5,20 +5,22 @@ import (
 	"os"
 
 	"github.com/aws/aws-sdk-go/service/cloudformation"
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
 	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 	"github.com/weaveworks/eksctl/pkg/eks"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
 )
 
 var (
 	describeStacksAll    bool
 	describeStacksEvents bool
+	describeStacksTrail  bool
 )
 
-func describeStacksCmd() *cobra.Command {
+func describeStacksCmd(g *cmdutils.Grouping) *cobra.Command {
 	p := &api.ProviderConfig{}
 	cfg := api.NewClusterConfig()
 
@@ -33,15 +35,19 @@ func describeStacksCmd() *cobra.Command {
 		},
 	}
 
-	fs := cmd.Flags()
+	group := g.New(cmd)
 
-	cmdutils.AddCommonFlagsForAWS(fs, p)
+	group.InFlagSet("General", func(fs *pflag.FlagSet) {
+		fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name")
+		cmdutils.AddRegionFlag(fs, p)
+		fs.BoolVar(&describeStacksAll, "all", false, "include deleted stacks")
+		fs.BoolVar(&describeStacksEvents, "events", false, "include stack events")
+		fs.BoolVar(&describeStacksTrail, "trail", false, "lookup CloudTrail events for the cluster")
+	})
 
-	fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name (required)")
+	cmdutils.AddCommonFlagsForAWS(group, p, false)
 
-	fs.BoolVar(&describeStacksAll, "all", false, "include deleted stacks")
-	fs.BoolVar(&describeStacksEvents, "events", false, "include stack events")
-
+	group.AddTo(cmd)
 	return cmd
 }
 
@@ -61,12 +67,12 @@ func doDescribeStacksCmd(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg 
 	}
 
 	if cfg.Metadata.Name == "" {
-		return fmt.Errorf("--name must be set")
+		return cmdutils.ErrMustBeSet("--name")
 	}
 
 	stackManager := ctl.NewStackManager(cfg)
 
-	stacks, err := stackManager.DescribeStacks(cfg.Metadata.Name)
+	stacks, err := stackManager.DescribeStacks()
 	if err != nil {
 		return err
 	}
@@ -86,7 +92,16 @@ func doDescribeStacksCmd(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg 
 				logger.Critical(err.Error())
 			}
 			for i, e := range events {
-				logger.Info("events/%s[%d] = %#v", *s.StackName, i, e)
+				logger.Info("CloudFormation.events/%s[%d] = %#v", *s.StackName, i, e)
+			}
+		}
+		if describeStacksTrail {
+			events, err := stackManager.LookupCloudTrailEvents(s)
+			if err != nil {
+				logger.Critical(err.Error())
+			}
+			for i, e := range events {
+				logger.Info("CloudTrail.events/%s[%d] = %#v", *s.StackName, i, e)
 			}
 		}
 	}

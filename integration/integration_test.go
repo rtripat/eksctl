@@ -5,18 +5,13 @@ package integration_test
 import (
 	"flag"
 	"testing"
-	"time"
 
-	"github.com/weaveworks/eksctl/pkg/eks/api"
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
 	"github.com/weaveworks/eksctl/pkg/testutils"
 )
 
 const (
-	createTimeout = 25 * time.Minute
-	deleteTimeout = 15 * time.Minute
-	getTimeout    = 1 * time.Minute
-	scaleTimeout  = 5 * time.Minute
-	region        = api.DefaultEKSRegion
+	region = api.DefaultRegion
 )
 
 var (
@@ -41,6 +36,6 @@ func init() {
 	flag.StringVar(&kubeconfigPath, "eksctl.kubeconfig", "", "Path to kubeconfig (default: create it a temporary file)")
 }
 
-func TestCreateIntegration(t *testing.T) {
-	testutils.RegisterAndRun(t, "(Integration) Create, Get, Scale & Delete")
+func TestSuite(t *testing.T) {
+	testutils.RegisterAndRun(t)
 }

@@ -4,43 +4,55 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
+	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 	"github.com/weaveworks/eksctl/pkg/eks"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
 )
 
-func scaleNodeGroupCmd() *cobra.Command {
+func scaleNodeGroupCmd(g *cmdutils.Grouping) *cobra.Command {
 	p := &api.ProviderConfig{}
 	cfg := api.NewClusterConfig()
 	ng := cfg.NewNodeGroup()
 
 	cmd := &cobra.Command{
-		Use:   "nodegroup",
-		Short: "Scale a nodegroup",
+		Use:     "nodegroup",
+		Short:   "Scale a nodegroup",
+		Aliases: []string{"ng"},
 		Run: func(_ *cobra.Command, args []string) {
-			if err := doScaleNodeGroup(p, cfg, ng); err != nil {
+			if err := doScaleNodeGroup(p, cfg, ng, cmdutils.GetNameArg(args)); err != nil {
 				logger.Critical("%s\n", err.Error())
 				os.Exit(1)
 			}
 		},
 	}
 
-	fs := cmd.Flags()
+	group := g.New(cmd)
 
-	fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name")
+	group.InFlagSet("General", func(fs *pflag.FlagSet) {
+		fs.StringVar(&cfg.Metadata.Name, "cluster", "", "EKS cluster name")
+		fs.StringVarP(&ng.Name, "name", "n", "", "Name of the nodegroup to scale")
 
-	fs.IntVarP(&ng.DesiredCapacity, "nodes", "N", -1, "total number of nodes (scale to this number)")
+		desiredCapacity := fs.IntP("nodes", "N", -1, "total number of nodes (scale to this number)")
+		cmdutils.AddPreRun(cmd, func(cmd *cobra.Command, args []string) {
+			if f := cmd.Flag("nodes"); f.Changed {
+				ng.DesiredCapacity = desiredCapacity
+			}
+		})
 
-	fs.StringVarP(&p.Region, "region", "r", "", "AWS region")
-	fs.StringVarP(&p.Profile, "profile", "p", "", "AWS creditials profile to use (overrides the AWS_PROFILE environment variable)")
+		cmdutils.AddRegionFlag(fs, p)
+	})
 
-	fs.DurationVar(&p.WaitTimeout, "timeout", api.DefaultWaitTimeout, "max wait time in any polling operations")
+	cmdutils.AddCommonFlagsForAWS(group, p, true)
+
+	group.AddTo(cmd)
 
 	return cmd
 }
 
-func doScaleNodeGroup(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.NodeGroup) error {
+func doScaleNodeGroup(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.NodeGroup, nameArg string) error {
 	ctl := eks.New(p, cfg)
 
 	if err := ctl.CheckAuth(); err != nil {
@@ -48,15 +60,27 @@ func doScaleNodeGroup(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.Nod
 	}
 
 	if cfg.Metadata.Name == "" {
-		return fmt.Errorf("no cluster name supplied. Use the --name= flag")
+		return cmdutils.ErrMustBeSet("--cluster")
 	}
 
-	if ng.DesiredCapacity < 0 {
+	if ng.Name != "" && nameArg != "" {
+		return cmdutils.ErrNameFlagAndArg(ng.Name, nameArg)
+	}
+
+	if nameArg != "" {
+		ng.Name = nameArg
+	}
+
+	if ng.Name == "" {
+		return cmdutils.ErrMustBeSet("--name")
+	}
+
+	if ng.DesiredCapacity == nil || *ng.DesiredCapacity < 0 {
 		return fmt.Errorf("number of nodes must be 0 or greater. Use the --nodes/-N flag")
 	}
 
 	stackManager := ctl.NewStackManager(cfg)
-	err := stackManager.ScaleInitialNodeGroup()
+	err := stackManager.ScaleNodeGroup(ng)
 	if err != nil {
 		return fmt.Errorf("failed to scale nodegroup for cluster %q, error %v", cfg.Metadata.Name, err)
 	}

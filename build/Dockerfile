@@ -1,11 +1,14 @@
-FROM golang:1.11-alpine3.8
+FROM golang:1.12-alpine3.9
 
 RUN apk add --no-cache \
       curl \
       git \
       make \
       gcc \
+      musl-dev \
       && true
+
+ENV CGO_ENABLED=0
 
 ENV DEP_VERSION v0.5.0
 
@@ -24,6 +27,6 @@ RUN dep ensure
 RUN ./install.sh
 
 WORKDIR $EKSCTL_BUILD/vendor/github.com/goreleaser/goreleaser
-RUN make build && go install
+RUN go build -tags netgo && go install -tags netgo
 
 WORKDIR $GOPATH

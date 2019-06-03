@@ -1,7 +1,6 @@
 package eks_test
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -9,18 +8,19 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	cfn "github.com/aws/aws-sdk-go/service/cloudformation"
 	awseks "github.com/aws/aws-sdk-go/service/eks"
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 	. "github.com/weaveworks/eksctl/pkg/eks"
 	"github.com/weaveworks/eksctl/pkg/testutils"
+	"github.com/weaveworks/eksctl/pkg/testutils/mockprovider"
 )
 
-var _ = Describe("Eks", func() {
+var _ = Describe("EKS API wrapper", func() {
 	var (
 		c      *ClusterProvider
-		p      *testutils.MockProvider
+		p      *mockprovider.MockProvider
 		output string
 	)
 
@@ -38,7 +38,7 @@ var _ = Describe("Eks", func() {
 			BeforeEach(func() {
 				clusterName = "test-cluster"
 
-				p = testutils.NewMockProvider()
+				p = mockprovider.NewMockProvider()
 
 				c = &ClusterProvider{
 					Provider: p,
@@ -68,22 +68,43 @@ var _ = Describe("Eks", func() {
 					Expect(p.MockEKS().AssertNumberOfCalls(GinkgoT(), "DescribeCluster", 1)).To(BeTrue())
 				})
 
-				It("should not call AWS CFN ListStackPages", func() {
+				It("should not call AWS CFN ListStacksPages", func() {
 					Expect(p.MockCloudFormation().AssertNumberOfCalls(GinkgoT(), "ListStacksPages", 0)).To(BeTrue())
 				})
 			})
 
 			Context("and debug log level", func() {
-				var (
-					expectedStatusFilter string
-				)
+
 				BeforeEach(func() {
-					expectedStatusFilter = "CREATE_COMPLETE"
+					expectedStatusFilter := []string{
+						"CREATE_IN_PROGRESS",
+						"CREATE_FAILED",
+						"CREATE_COMPLETE",
+						"ROLLBACK_IN_PROGRESS",
+						"ROLLBACK_FAILED",
+						"ROLLBACK_COMPLETE",
+						"DELETE_IN_PROGRESS",
+						"DELETE_FAILED",
+						"UPDATE_IN_PROGRESS",
+						"UPDATE_COMPLETE_CLEANUP_IN_PROGRESS",
+						"UPDATE_COMPLETE",
+						"UPDATE_ROLLBACK_IN_PROGRESS",
+						"UPDATE_ROLLBACK_FAILED",
+						"UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS",
+						"UPDATE_ROLLBACK_COMPLETE",
+						"REVIEW_IN_PROGRESS",
+					}
 
 					logger.Level = 4
 
 					p.MockCloudFormation().On("ListStacksPages", mock.MatchedBy(func(input *cfn.ListStacksInput) bool {
-						return *input.StackStatusFilter[0] == expectedStatusFilter
+						matches := 0
+						for i := range input.StackStatusFilter {
+							if *input.StackStatusFilter[i] == expectedStatusFilter[i] {
+								matches++
+							}
+						}
+						return matches == len(expectedStatusFilter)
 					}), mock.Anything).Return(nil)
 				})
 
@@ -99,7 +120,7 @@ var _ = Describe("Eks", func() {
 					Expect(p.MockEKS().AssertNumberOfCalls(GinkgoT(), "DescribeCluster", 1)).To(BeTrue())
 				})
 
-				It("should have called AWS CFN ListStackPages", func() {
+				It("should have called AWS CFN ListStacksPages", func() {
 					Expect(p.MockCloudFormation().AssertNumberOfCalls(GinkgoT(), "ListStacksPages", 1)).To(BeTrue())
 				})
 			})
@@ -122,7 +143,7 @@ var _ = Describe("Eks", func() {
 				clusterName = "test-cluster"
 				logger.Level = 1
 
-				p = testutils.NewMockProvider()
+				p = mockprovider.NewMockProvider()
 
 				c = &ClusterProvider{
 					Provider: p,
@@ -151,7 +172,7 @@ var _ = Describe("Eks", func() {
 				Expect(p.MockEKS().AssertNumberOfCalls(GinkgoT(), "DescribeCluster", 1)).To(BeTrue())
 			})
 
-			It("should not call AWS CFN ListStackPages", func() {
+			It("should not call AWS CFN ListStacksPages", func() {
 				Expect(p.MockCloudFormation().AssertNumberOfCalls(GinkgoT(), "ListStacksPages", 0)).To(BeTrue())
 			})
 
@@ -164,14 +185,7 @@ var _ = Describe("Eks", func() {
 
 				actualOutput, _ := ioutil.ReadAll(reader)
 
-				bytesAreEqual := bytes.Equal(actualOutput, g)
-
-				if !bytesAreEqual {
-					fmt.Printf("\nActual:\n%s\n", string(actualOutput))
-					fmt.Printf("Expected:\n%s\n", string(g))
-				}
-
-				Expect(bytesAreEqual).To(BeTrue())
+				Expect(actualOutput).Should(MatchJSON(string(g)))
 			})
 		})
 
@@ -189,7 +203,7 @@ var _ = Describe("Eks", func() {
 					chunkSize = 1
 					callNumber = 0
 
-					p = testutils.NewMockProvider()
+					p = mockprovider.NewMockProvider()
 
 					c = &ClusterProvider{
 						Provider: p,
@@ -229,7 +243,7 @@ var _ = Describe("Eks", func() {
 				BeforeEach(func() {
 					chunkSize = 100
 
-					p = testutils.NewMockProvider()
+					p = mockprovider.NewMockProvider()
 
 					c = &ClusterProvider{
 						Provider: p,

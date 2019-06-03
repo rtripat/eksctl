@@ -1,16 +1,13 @@
 package kops
 
 import (
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/kris-nova/logger"
 	"github.com/pkg/errors"
-
-	"github.com/weaveworks/eksctl/pkg/eks/api"
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
 	"github.com/weaveworks/eksctl/pkg/vpc"
-
 	"k8s.io/kops/pkg/resources/aws"
 	"k8s.io/kops/upup/pkg/fi/cloudup/awsup"
-
-	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
 // Wrapper for interacting with a kops cluster
@@ -44,6 +41,8 @@ func (k *Wrapper) topologyOf(s *ec2.Subnet) api.SubnetTopology {
 
 // UseVPC finds VPC and subnets that give kops cluster uses and add those to EKS cluster config
 func (k *Wrapper) UseVPC(provider api.ClusterProvider, spec *api.ClusterConfig) error {
+	spec.VPC.CIDR = nil // ensure to reset the CIDR
+
 	allSubnets, err := aws.ListSubnets(k.cloud, k.clusterName)
 	if err != nil {
 		return err

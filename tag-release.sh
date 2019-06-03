@@ -9,13 +9,25 @@ if [ "$#" -ne 1 ] ; then
   exit 1
 fi
 
+if [ ! "$(git rev-parse --abbrev-ref @)" = master ] ; then
+  echo "Must be on master branch"
+  exit 2
+fi
+
 v="${1}"
+
+RELEASE_NOTES_FILE="docs/release_notes/${v}.md"
+
+if [[ ! -f "${RELEASE_NOTES_FILE}" ]]; then
+  echo "Must have release notes ${RELEASE_NOTES_FILE}"
+  exit 3
+fi
 
 export RELEASE_GIT_TAG="${v}"
 
-go generate ./cmd/eksctl
+go generate ./pkg/version
 
-git add ./cmd/eksctl/version_release.go
+git add ./pkg/version/release.go
 
 m="Tag ${v} release"
 

@@ -1,12 +1,9 @@
 package get
 
 import (
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
-)
-
-const (
-	defaultChunkSize = 100
+	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 )
 
 var (
@@ -15,7 +12,7 @@ var (
 )
 
 // Command will create the `get` commands
-func Command() *cobra.Command {
+func Command(g *cmdutils.Grouping) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "get",
 		Short: "Get resource(s)",
@@ -26,7 +23,8 @@ func Command() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(getClusterCmd())
+	cmd.AddCommand(getClusterCmd(g))
+	cmd.AddCommand(getNodegroupCmd(g))
 
 	return cmd
 }

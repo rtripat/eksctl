@@ -29,9 +29,9 @@ var initRequest func(*request.Request)
 
 // Service information constants
 const (
-	ServiceName = "eks"       // Service endpoint prefix API calls made to.
-	EndpointsID = ServiceName // Service ID for Regions and Endpoints metadata.
-	ServiceID   = "EKS"       // ServiceID is a unique identifer of a specific service
+	ServiceName = "eks"       // Name of service.
+	EndpointsID = ServiceName // ID to lookup a service endpoint with.
+	ServiceID   = "EKS"       // ServiceID is a unique identifer of a specific service.
 )
 
 // New creates a new instance of the EKS client with a session.
@@ -64,7 +64,6 @@ func newClient(cfg aws.Config, handlers request.Handlers, endpoint, signingRegio
 				SigningRegion: signingRegion,
 				Endpoint:      endpoint,
 				APIVersion:    "2017-11-01",
-				JSONVersion:   "1.1",
 			},
 			handlers,
 		),

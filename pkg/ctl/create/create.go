@@ -1,12 +1,17 @@
 package create
 
 import (
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
+	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
+)
+
+var (
+	clusterConfigFile = ""
 )
 
 // Command will create the `create` commands
-func Command() *cobra.Command {
+func Command(g *cmdutils.Grouping) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create resource(s)",
@@ -17,7 +22,8 @@ func Command() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(createClusterCmd())
+	cmd.AddCommand(createClusterCmd(g))
+	cmd.AddCommand(createNodeGroupCmd(g))
 
 	return cmd
 }

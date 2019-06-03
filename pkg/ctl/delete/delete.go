@@ -1,16 +1,20 @@
 package delete
 
 import (
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
+	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 )
 
 var (
-	waitDelete bool
+	wait = false
+	plan = true
+
+	clusterConfigFile = ""
 )
 
 // Command will create the `delete` commands
-func Command() *cobra.Command {
+func Command(g *cmdutils.Grouping) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "delete",
 		Short: "Delete resource(s)",
@@ -21,7 +25,8 @@ func Command() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(deleteClusterCmd())
+	cmd.AddCommand(deleteClusterCmd(g))
+	cmd.AddCommand(deleteNodeGroupCmd(g))
 
 	return cmd
 }

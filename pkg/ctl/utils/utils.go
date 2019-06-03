@@ -1,12 +1,19 @@
 package utils
 
 import (
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
+	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
+)
+
+var (
+	clusterConfigFile = ""
+
+	plan = true
 )
 
 // Command will create the `utils` commands
-func Command() *cobra.Command {
+func Command(g *cmdutils.Grouping) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "utils",
 		Short: "Various utils",
@@ -17,9 +24,14 @@ func Command() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(waitNodesCmd())
-	cmd.AddCommand(writeKubeconfigCmd())
-	cmd.AddCommand(describeStacksCmd())
+	cmd.AddCommand(waitNodesCmd(g))
+	cmd.AddCommand(writeKubeconfigCmd(g))
+	cmd.AddCommand(describeStacksCmd(g))
+	cmd.AddCommand(updateClusterStackCmd(g))
+	cmd.AddCommand(updateKubeProxyCmd(g))
+	cmd.AddCommand(updateAWSNodeCmd(g))
+	cmd.AddCommand(updateCoreDNSCmd(g))
+	cmd.AddCommand(installCoreDNSCmd(g))
 
 	return cmd
 }

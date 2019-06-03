@@ -1,20 +1,21 @@
 package utils
 
 import (
-	"fmt"
 	"os"
 
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
+	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 	"github.com/weaveworks/eksctl/pkg/eks"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 var waitNodesKubeconfigPath string
 
-func waitNodesCmd() *cobra.Command {
+func waitNodesCmd(g *cmdutils.Grouping) *cobra.Command {
 	p := &api.ProviderConfig{}
 	cfg := api.NewClusterConfig()
 	ng := cfg.NewNodeGroup()
@@ -30,11 +31,20 @@ func waitNodesCmd() *cobra.Command {
 		},
 	}
 
-	fs := cmd.Flags()
+	group := g.New(cmd)
 
-	fs.StringVar(&waitNodesKubeconfigPath, "kubeconfig", "kubeconfig", "path to read kubeconfig")
-	fs.IntVarP(&ng.MinSize, "nodes-min", "m", api.DefaultNodeCount, "minimum number of nodes to wait for")
-	fs.DurationVar(&p.WaitTimeout, "timeout", api.DefaultWaitTimeout, "how long to wait")
+	group.InFlagSet("General", func(fs *pflag.FlagSet) {
+		fs.StringVar(&waitNodesKubeconfigPath, "kubeconfig", "kubeconfig", "path to read kubeconfig")
+		minSize := fs.IntP("nodes-min", "m", api.DefaultNodeCount, "minimum number of nodes to wait for")
+		cmdutils.AddPreRun(cmd, func(cmd *cobra.Command, args []string) {
+			if f := cmd.Flag("nodes-min"); f.Changed {
+				ng.MinSize = minSize
+			}
+		})
+		fs.DurationVar(&p.WaitTimeout, "timeout", api.DefaultWaitTimeout, "how long to wait")
+	})
+
+	group.AddTo(cmd)
 
 	return cmd
 }
@@ -43,7 +53,7 @@ func doWaitNodes(p *api.ProviderConfig, cfg *api.ClusterConfig, ng *api.NodeGrou
 	ctl := eks.New(p, cfg)
 
 	if waitNodesKubeconfigPath == "" {
-		return fmt.Errorf("--kubeconfig must be set")
+		return cmdutils.ErrMustBeSet("--kubeconfig")
 	}
 
 	clientConfig, err := clientcmd.BuildConfigFromFlags("", waitNodesKubeconfigPath)

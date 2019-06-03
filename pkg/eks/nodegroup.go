@@ -4,57 +4,18 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ghodss/yaml"
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/pkg/errors"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
+	"github.com/weaveworks/eksctl/pkg/cfn/manager"
+	"github.com/weaveworks/eksctl/pkg/iam"
+
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
-	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes"
 )
-
-func (c *ClusterProvider) newNodeAuthConfigMap(ng *api.NodeGroup) (*corev1.ConfigMap, error) {
-	mapRoles := make([]map[string]interface{}, 1)
-	mapRoles[0] = make(map[string]interface{})
-
-	mapRoles[0]["rolearn"] = ng.InstanceRoleARN
-	mapRoles[0]["username"] = "system:node:{{EC2PrivateDNSName}}"
-	mapRoles[0]["groups"] = []string{
-		"system:bootstrappers",
-		"system:nodes",
-	}
-
-	mapRolesBytes, err := yaml.Marshal(mapRoles)
-	if err != nil {
-		return nil, err
-	}
-
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "aws-auth",
-			Namespace: "kube-system",
-		},
-		Data: map[string]string{
-			"mapRoles": string(mapRolesBytes),
-		},
-	}
-
-	return cm, nil
-}
-
-// CreateNodeGroupAuthConfigMap creates the auth config map for the default node group
-func (c *ClusterProvider) CreateNodeGroupAuthConfigMap(clientSet *clientset.Clientset, ng *api.NodeGroup) error {
-	cm, err := c.newNodeAuthConfigMap(ng)
-	if err != nil {
-		return errors.Wrap(err, "constructing auth ConfigMap for DefaultNodeGroup")
-	}
-	if _, err := clientSet.CoreV1().ConfigMaps("kube-system").Create(cm); err != nil {
-		return errors.Wrap(err, "creating auth ConfigMap for DefaultNodeGroup")
-	}
-	return nil
-}
 
 func isNodeReady(node *corev1.Node) bool {
 	for _, c := range node.Status.Conditions {
@@ -65,52 +26,56 @@ func isNodeReady(node *corev1.Node) bool {
 	return false
 }
 
-func getNodes(clientSet *clientset.Clientset) (int, error) {
-	nodes, err := clientSet.CoreV1().Nodes().List(metav1.ListOptions{})
+func getNodes(clientSet kubernetes.Interface, ng *api.NodeGroup) (int, error) {
+	nodes, err := clientSet.CoreV1().Nodes().List(ng.ListOptions())
 	if err != nil {
 		return 0, err
 	}
-	logger.Info("the cluster has %d nodes", len(nodes.Items))
+	logger.Info("nodegroup %q has %d node(s)", ng.Name, len(nodes.Items))
+	counter := 0
 	for _, node := range nodes.Items {
 		// logger.Debug("node[%d]=%#v", n, node)
 		ready := "not ready"
 		if isNodeReady(&node) {
 			ready = "ready"
+			counter++
 		}
 		logger.Info("node %q is %s", node.ObjectMeta.Name, ready)
 	}
-	return len(nodes.Items), nil
+	return counter, nil
 }
 
 // WaitForNodes waits till the nodes are ready
-func (c *ClusterProvider) WaitForNodes(clientSet *clientset.Clientset, ng *api.NodeGroup) error {
-	if ng.MinSize == 0 {
+func (c *ClusterProvider) WaitForNodes(clientSet kubernetes.Interface, ng *api.NodeGroup) error {
+	if ng.MinSize == nil || *ng.MinSize == 0 {
 		return nil
 	}
 	timer := time.After(c.Provider.WaitTimeout())
 	timeout := false
-	watcher, err := clientSet.CoreV1().Nodes().Watch(metav1.ListOptions{})
+	readyNodes := sets.NewString()
+	watcher, err := clientSet.CoreV1().Nodes().Watch(ng.ListOptions())
 	if err != nil {
 		return errors.Wrap(err, "creating node watcher")
 	}
 
-	counter, err := getNodes(clientSet)
+	counter, err := getNodes(clientSet, ng)
 	if err != nil {
 		return errors.Wrap(err, "listing nodes")
 	}
 
-	logger.Info("waiting for at least %d nodes to become ready", ng.MinSize)
-	for !timeout && counter <= ng.MinSize {
+	logger.Info("waiting for at least %d node(s) to become ready in %q", *ng.MinSize, ng.Name)
+	for !timeout && counter < *ng.MinSize {
 		select {
 		case event := <-watcher.ResultChan():
 			logger.Debug("event = %#v", event)
 			if event.Object != nil && event.Type != watch.Deleted {
 				if node, ok := event.Object.(*corev1.Node); ok {
 					if isNodeReady(node) {
-						counter++
-						logger.Debug("node %q is ready", node.ObjectMeta.Name)
+						readyNodes.Insert(node.Name)
+						counter = readyNodes.Len()
+						logger.Debug("node %q is ready in %q", node.Name, ng.Name)
 					} else {
-						logger.Debug("node %q seen, but not ready yet", node.ObjectMeta.Name)
+						logger.Debug("node %q seen in %q, but not ready yet", node.Name, ng.Name)
 						logger.Debug("node = %#v", *node)
 					}
 				}
@@ -119,13 +84,33 @@ func (c *ClusterProvider) WaitForNodes(clientSet *clientset.Clientset, ng *api.N
 			timeout = true
 		}
 	}
+	watcher.Stop()
 	if timeout {
-		return fmt.Errorf("timed out (after %s) waitiing for at least %d nodes to join the cluster and become ready", c.Provider.WaitTimeout(), ng.MinSize)
+		return fmt.Errorf("timed out (after %s) waiting for at least %d nodes to join the cluster and become ready in %q", c.Provider.WaitTimeout(), *ng.MinSize, ng.Name)
 	}
 
-	if _, err = getNodes(clientSet); err != nil {
+	if _, err = getNodes(clientSet, ng); err != nil {
 		return errors.Wrap(err, "re-listing nodes")
 	}
 
 	return nil
+}
+
+// GetNodeGroupIAM retrieves the IAM configuration of the given nodegroup
+func (c *ClusterProvider) GetNodeGroupIAM(stackManager *manager.StackCollection, spec *api.ClusterConfig, ng *api.NodeGroup) error {
+	stacks, err := stackManager.DescribeNodeGroupStacks()
+	if err != nil {
+		return err
+	}
+
+	for _, s := range stacks {
+		if stackManager.GetNodeGroupName(s) == ng.Name {
+			if !stackManager.StackStatusIsNotTransitional(s) {
+				return fmt.Errorf("nodegroup %q is in transitional state (%q)", ng.Name, *s.StackStatus)
+			}
+			return iam.UseFromNodeGroup(c.Provider, s, ng)
+		}
+	}
+
+	return fmt.Errorf("stack not found for nodegroup %q", ng.Name)
 }

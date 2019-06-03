@@ -2,117 +2,142 @@ package delete
 
 import (
 	"fmt"
+	ssh "github.com/weaveworks/eksctl/pkg/ssh"
 	"os"
-	"strings"
 
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/pkg/errors"
+	"github.com/weaveworks/eksctl/pkg/cfn/manager"
+	"github.com/weaveworks/eksctl/pkg/utils/kubeconfig"
+	"github.com/weaveworks/eksctl/pkg/vpc"
+
+	"github.com/kris-nova/logger"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
 	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 	"github.com/weaveworks/eksctl/pkg/eks"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
-	"github.com/weaveworks/eksctl/pkg/utils/kubeconfig"
+	"github.com/weaveworks/eksctl/pkg/printers"
 )
 
-func deleteClusterCmd() *cobra.Command {
+func deleteClusterCmd(g *cmdutils.Grouping) *cobra.Command {
 	p := &api.ProviderConfig{}
 	cfg := api.NewClusterConfig()
 
 	cmd := &cobra.Command{
 		Use:   "cluster",
 		Short: "Delete a cluster",
-		Run: func(_ *cobra.Command, args []string) {
-			if err := doDeleteCluster(p, cfg, cmdutils.GetNameArg(args)); err != nil {
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := doDeleteCluster(p, cfg, cmdutils.GetNameArg(args), cmd); err != nil {
 				logger.Critical("%s\n", err.Error())
 				os.Exit(1)
 			}
 		},
 	}
 
-	fs := cmd.Flags()
+	group := g.New(cmd)
 
-	fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name (required)")
+	group.InFlagSet("General", func(fs *pflag.FlagSet) {
+		fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name")
+		cmdutils.AddRegionFlag(fs, p)
+		cmdutils.AddWaitFlag(&wait, fs, "deletion of all resources")
+		cmdutils.AddConfigFileFlag(&clusterConfigFile, fs)
+	})
 
-	cmdutils.AddCommonFlagsForAWS(fs, p)
+	cmdutils.AddCommonFlagsForAWS(group, p, true)
 
-	fs.BoolVarP(&waitDelete, "wait", "w", false, "Wait for deletion of all resources before exiting")
-
+	group.AddTo(cmd)
 	return cmd
 }
 
-func doDeleteCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg string) error {
+func handleErrors(errs []error, subject string) error {
+	logger.Info("%d error(s) occurred while deleting %s", len(errs), subject)
+	for _, err := range errs {
+		logger.Critical("%s\n", err.Error())
+	}
+	return fmt.Errorf("failed to delete %s", subject)
+}
+
+func deleteDeprecatedStacks(stackManager *manager.StackCollection) (bool, error) {
+	tasks, err := stackManager.DeleteTasksForDeprecatedStacks()
+	if err != nil {
+		return true, err
+	}
+	if count := tasks.Len(); count > 0 {
+		logger.Info(tasks.Describe())
+		if errs := tasks.DoAllSync(); len(errs) > 0 {
+			return true, handleErrors(errs, "deprecated stacks")
+		}
+		logger.Success("deleted all %s deperecated stacks", count)
+		return true, nil
+	}
+	return false, nil
+}
+
+func doDeleteCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg string, cmd *cobra.Command) error {
+	printer := printers.NewJSONPrinter()
+
+	if err := cmdutils.NewMetadataLoader(p, cfg, clusterConfigFile, nameArg, cmd).Load(); err != nil {
+		return err
+	}
+
 	ctl := eks.New(p, cfg)
+	meta := cfg.Metadata
+
+	if !ctl.IsSupportedRegion() {
+		return cmdutils.ErrUnsupportedRegion(p)
+	}
+	logger.Info("using region %s", meta.Region)
 
 	if err := ctl.CheckAuth(); err != nil {
 		return err
 	}
 
-	if cfg.Metadata.Name != "" && nameArg != "" {
-		return cmdutils.ErrNameFlagAndArg(cfg.Metadata.Name, nameArg)
+	logger.Info("deleting EKS cluster %q", meta.Name)
+	if err := printer.LogObj(logger.Debug, "cfg.json = \\\n%s\n", cfg); err != nil {
+		return err
 	}
-
-	if nameArg != "" {
-		cfg.Metadata.Name = nameArg
-	}
-
-	if cfg.Metadata.Name == "" {
-		return fmt.Errorf("--name must be set")
-	}
-
-	logger.Info("deleting EKS cluster %q", cfg.Metadata.Name)
-
-	var deletedResources []string
-
-	handleIfError := func(err error, name string) bool {
-		if err != nil {
-			logger.Debug("continue despite error: %v", err)
-			return true
-		}
-		logger.Debug("deleted %q", name)
-		deletedResources = append(deletedResources, name)
-		return false
-	}
-
-	// We can remove all 'DeprecatedDelete*' calls in 0.2.0
 
 	stackManager := ctl.NewStackManager(cfg)
 
+	ssh.DeleteKeys(meta.Name, ctl.Provider)
+
+	kubeconfig.MaybeDeleteConfig(meta)
+
+	if hasDeprectatedStacks, err := deleteDeprecatedStacks(stackManager); hasDeprectatedStacks {
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
 	{
-		errs := stackManager.WaitDeleteAllNodeGroups()
-		if len(errs) > 0 {
-			logger.Info("%d error(s) occurred while deleting nodegroup(s)", len(errs))
-			for _, err := range errs {
-				logger.Critical("%s\n", err.Error())
+		tasks, err := stackManager.NewTasksToDeleteClusterWithNodeGroups(wait, func(errs chan error, _ string) error {
+			logger.Info("trying to cleanup dangling network interfaces")
+			if err := ctl.GetClusterVPC(cfg); err != nil {
+				return errors.Wrapf(err, "getting VPC configuration for cluster %q", cfg.Metadata.Name)
 			}
-			handleIfError(fmt.Errorf("failed to delete nodegroup(s)"), "nodegroup(s)")
+			go func() {
+				errs <- vpc.CleanupNetworkInterfaces(ctl.Provider, cfg)
+				close(errs)
+			}()
+			return nil
+		})
+
+		if err != nil {
+			return err
 		}
-		logger.Debug("all nodegroups were deleted")
-	}
 
-	var clusterErr bool
-	if waitDelete {
-		clusterErr = handleIfError(stackManager.WaitDeleteCluster(), "cluster")
-	} else {
-		clusterErr = handleIfError(stackManager.DeleteCluster(), "cluster")
-	}
-
-	if clusterErr {
-		if handleIfError(ctl.DeprecatedDeleteControlPlane(cfg.Metadata), "control plane") {
-			handleIfError(stackManager.DeprecatedDeleteStackControlPlane(waitDelete), "stack control plane (deprecated)")
+		if tasks.Len() == 0 {
+			logger.Warning("no cluster resources were found for %q", meta.Name)
+			return nil
 		}
-	}
 
-	handleIfError(stackManager.DeprecatedDeleteStackServiceRole(waitDelete), "service group (deprecated)")
-	handleIfError(stackManager.DeprecatedDeleteStackVPC(waitDelete), "stack VPC (deprecated)")
-	handleIfError(stackManager.DeprecatedDeleteStackDefaultNodeGroup(waitDelete), "default nodegroup (deprecated)")
+		logger.Info(tasks.Describe())
+		if errs := tasks.DoAllSync(); len(errs) > 0 {
+			return handleErrors(errs, "cluster with nodegroup(s)")
+		}
 
-	ctl.MaybeDeletePublicSSHKey(cfg.Metadata.Name)
-
-	kubeconfig.MaybeDeleteConfig(cfg.Metadata)
-
-	if len(deletedResources) == 0 {
-		logger.Warning("no EKS cluster resources were found for %q", cfg.Metadata.Name)
-	} else {
-		logger.Success("the following EKS cluster resource(s) for %q will be deleted: %s. If in doubt, check CloudFormation console", cfg.Metadata.Name, strings.Join(deletedResources, ", "))
+		logger.Success("all cluster resources were deleted")
 	}
 
 	return nil

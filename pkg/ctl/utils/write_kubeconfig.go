@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kubicorn/kubicorn/pkg/logger"
+	"github.com/kris-nova/logger"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
+	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha5"
 	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 	"github.com/weaveworks/eksctl/pkg/eks"
-	"github.com/weaveworks/eksctl/pkg/eks/api"
 	"github.com/weaveworks/eksctl/pkg/utils/kubeconfig"
 )
 
@@ -20,7 +21,7 @@ var (
 	writeKubeconfigAutoPath   bool
 )
 
-func writeKubeconfigCmd() *cobra.Command {
+func writeKubeconfigCmd(g *cmdutils.Grouping) *cobra.Command {
 	p := &api.ProviderConfig{}
 	cfg := api.NewClusterConfig()
 
@@ -35,14 +36,20 @@ func writeKubeconfigCmd() *cobra.Command {
 		},
 	}
 
-	fs := cmd.Flags()
+	group := g.New(cmd)
 
-	fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name (required)")
+	group.InFlagSet("General", func(fs *pflag.FlagSet) {
+		fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name")
+		cmdutils.AddRegionFlag(fs, p)
+	})
 
-	cmdutils.AddCommonFlagsForAWS(fs, p)
+	group.InFlagSet("Output kubeconfig", func(fs *pflag.FlagSet) {
+		cmdutils.AddCommonFlagsForKubeconfig(fs, &writeKubeconfigOutputPath, &writeKubeconfigSetContext, &writeKubeconfigAutoPath, "<name>")
+	})
 
-	cmdutils.AddCommonFlagsForKubeconfig(fs, &writeKubeconfigOutputPath, &writeKubeconfigSetContext, &writeKubeconfigAutoPath, "<name>")
+	cmdutils.AddCommonFlagsForAWS(group, p, false)
 
+	group.AddTo(cmd)
 	return cmd
 }
 
@@ -62,7 +69,7 @@ func doWriteKubeconfigCmd(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg
 	}
 
 	if cfg.Metadata.Name == "" {
-		return fmt.Errorf("--name must be set")
+		return cmdutils.ErrMustBeSet("--name")
 	}
 
 	if writeKubeconfigAutoPath {
@@ -72,24 +79,16 @@ func doWriteKubeconfigCmd(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg
 		writeKubeconfigOutputPath = kubeconfig.AutoPath(cfg.Metadata.Name)
 	}
 
-	cluster, err := ctl.DescribeControlPlane(cfg.Metadata)
+	if err := ctl.GetCredentials(cfg); err != nil {
+		return err
+	}
+
+	client, err := ctl.NewClient(cfg, false)
 	if err != nil {
 		return err
 	}
 
-	logger.Debug("cluster = %#v", cluster)
-
-	if err = ctl.GetCredentials(*cluster, cfg); err != nil {
-		return err
-	}
-
-	clientConfigBase, err := ctl.NewClientConfig(cfg)
-	if err != nil {
-		return err
-	}
-
-	config := clientConfigBase.WithExecAuthenticator()
-	filename, err := kubeconfig.Write(writeKubeconfigOutputPath, config.Client, writeKubeconfigSetContext)
+	filename, err := kubeconfig.Write(writeKubeconfigOutputPath, *client.Config, writeKubeconfigSetContext)
 	if err != nil {
 		return errors.Wrap(err, "writing kubeconfig")
 	}
